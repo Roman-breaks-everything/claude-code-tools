@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""
+caramba-switch — конвертер раскладки выделенного текста для Linux.
+
+Аналог фичи Caramba/Punto Switcher: выделяешь текст, жмёшь Shift два раза
+подряд — выделенное перекодируется между RU и EN раскладками прямо на месте.
+
+Цель: Fedora KDE Plasma (Wayland). Замена делается через буфер обмена + Ctrl+V,
+т.к. KWin не поддерживает набор Unicode виртуальной клавиатурой.
+
+Режимы:
+  --daemon        слушать двойной Shift через evdev и конвертировать (основной)
+  --once          сделать одну конверсию текущего выделения (для KDE-хоткея)
+  --convert TEXT  напечатать перекодированный TEXT (или stdin) и выйти — без системы
+  --selftest      прогнать встроенные проверки таблицы
+
+Зависимости (Fedora):  sudo dnf install python3-evdev wl-clipboard ydotool
+"""
+
+import argparse
+import subprocess
+import sys
+import time
+
+# --- таблица раскладок: позиционное соответствие клавиш US QWERTY <-> RU ЙЦУКЕН ---
+# нижний регистр
+_EN = r"`qwertyuiop[]asdfghjkl;'zxcvbnm,./"
+_RU = "ёйцукенгшщзхъфывапролджэячсмитьбю."
+# верхний регистр / с Shift (буквы + знаки на буквенных клавишах)
+_EN_SH = r'~QWERTYUIOP{}ASDFGHJKL:"ZXCVBNM<>?'
+_RU_SH = "ЁЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,"
+# числовой ряд с Shift (US ! @ # $ % ^ & *  <->  RU ! " № ; % : ? *)
+_EN_NUM = r"!@#$%^&*()_+"
+_RU_NUM = '!"№;%:?*()_+'
+
+en2ru, ru2en = {}, {}
+for _pair in (zip(_EN, _RU), zip(_EN_SH, _RU_SH), zip(_EN_NUM, _RU_NUM)):
+    for e, r in _pair:
+        en2ru[e] = r
+        ru2en[r] = e
+
+
+def _is_cyr(ch):
+    c = ch.lower()
+    return ("а" <= c <= "я") or c == "ё"
+
+
+def _is_lat(ch):
+    return "a" <= ch.lower() <= "z"
+
+
+def convert(text):
+    """Автоопределение направления: больше кириллицы -> RU->EN, иначе EN->RU."""
+    cyr = sum(_is_cyr(c) for c in text)
+    lat = sum(_is_lat(c) for c in text)
+    table = ru2en if cyr > lat else en2ru
+    return "".join(table.get(c, c) for c in text)
+
+
+# --- системная часть (нужна только для --once / --daemon) ---
+
+def _run(cmd, inp=None, timeout=2):
+    return subprocess.run(cmd, input=inp, capture_output=True, timeout=timeout)
+
+
+def _ydotool_key(*codes):
+    # коды evdev: LEFTCTRL=29, C=46, V=47 ; ":1" нажать, ":0" отпустить
+    _run(["ydotool", "key", *codes])
+
+
+def _get_selection():
+    """PRIMARY-буфер (текущее выделение). Фолбэк — Ctrl+C и чтение clipboard."""
+    r = _run(["wl-paste", "-p", "-n"])
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.decode("utf-8", "replace")
+    _ydotool_key("29:1", "46:1", "46:0", "29:0")  # Ctrl+C
+    time.sleep(0.15)
+    r = _run(["wl-paste", "-n"])
+    return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+
+
+def do_once():
+    """Одна конверсия: прочитать выделение, перекодировать, заменить через Ctrl+V."""
+    saved = _run(["wl-paste", "-n"]).stdout  # сохранить текущий clipboard (bytes)
+    sel = _get_selection()
+    if not sel.strip():
+        return False
+    out = convert(sel)
+    _run(["wl-copy"], inp=out.encode("utf-8"))
+    time.sleep(0.05)
+    _ydotool_key("29:1", "47:1", "47:0", "29:0")  # Ctrl+V — заменяет выделение
+    time.sleep(0.15)
+    if saved:
+        _run(["wl-copy"], inp=saved)  # вернуть прежний clipboard
+    else:
+        _run(["wl-copy", "--clear"])
+    return True
+
+
+def run_daemon(threshold=0.4):
+    """Слушать evdev, ловить двойной Shift-тап, звать do_once()."""
+    import selectors
+
+    import evdev
+    from evdev import ecodes
+
+    shifts = {ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT}
+
+    def keyboards():
+        devs = []
+        for path in evdev.list_devices():
+            try:
+                d = evdev.InputDevice(path)
+            except OSError:
+                continue
+            caps = d.capabilities().get(ecodes.EV_KEY, [])
+            if ecodes.KEY_A in caps and ecodes.KEY_Z in caps:
+                devs.append(d)
+        return devs
+
+    devs = keyboards()
+    if not devs:
+        sys.exit("Не найдено ни одной клавиатуры в /dev/input. "
+                 "Проверь, что ты в группе input.")
+    print("caramba-switch: слушаю двойной Shift на: "
+          + ", ".join(d.name for d in devs), flush=True)
+
+    sel = selectors.DefaultSelector()
+    for d in devs:
+        sel.register(d, selectors.EVENT_READ)
+
+    last_up = 0.0      # время предыдущего отпускания Shift
+    dirty = False      # была ли между шифтами нажата другая клавиша
+
+    while True:
+        for key, _ in sel.select():
+            for ev in key.fileobj.read():
+                if ev.type != ecodes.EV_KEY:
+                    continue
+                if ev.code in shifts:
+                    if ev.value == 0:  # Shift отпущен
+                        now = time.monotonic()
+                        if (now - last_up) <= threshold and not dirty:
+                            do_once()
+                            last_up = 0.0
+                        else:
+                            last_up = now
+                        dirty = False
+                elif ev.value == 1:    # нажата НЕ-Shift клавиша
+                    dirty = True
+
+
+def selftest():
+    cases = [
+        ("ghbdtn", "привет"),
+        ("Ghbdtn", "Привет"),
+        ("руддщ", "hello"),
+        # реальный мусор при наборе "Привет, как дела?" на EN-раскладке:
+        ("Ghbdtn? rfr ltkf&", "Привет, как дела?"),
+        ("Привет", "Ghbdtn"),
+        ("[jhjij", "хорошо"),
+        ("Crblrf 50% — pdjyb!", "Скидка 50% — звони!"),
+    ]
+    ok = True
+    for src, want in cases:
+        got = convert(src)
+        mark = "OK " if got == want else "FAIL"
+        if got != want:
+            ok = False
+        print(f"  [{mark}] {src!r:30} -> {got!r:30} (ждали {want!r})")
+    print("selftest:", "ВСЁ ЗЕЛЁНОЕ" if ok else "ЕСТЬ ПАДЕНИЯ")
+    sys.exit(0 if ok else 1)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Конвертер раскладки выделенного текста")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--daemon", action="store_true", help="слушать двойной Shift (evdev)")
+    g.add_argument("--once", action="store_true", help="одна конверсия выделения (для хоткея KDE)")
+    g.add_argument("--convert", nargs="?", const="", metavar="TEXT",
+                   help="перекодировать TEXT (или stdin) и вывести, без системы")
+    g.add_argument("--selftest", action="store_true", help="проверить таблицу")
+    ap.add_argument("--threshold", type=float, default=0.4,
+                    help="макс. пауза между Shift, сек (по умолчанию 0.4)")
+    args = ap.parse_args()
+
+    if args.selftest:
+        selftest()
+    elif args.convert is not None:
+        text = args.convert or sys.stdin.read()
+        sys.stdout.write(convert(text))
+    elif args.once:
+        sys.exit(0 if do_once() else 1)
+    elif args.daemon:
+        run_daemon(args.threshold)
+    else:
+        ap.print_help()
+
+
+if __name__ == "__main__":
+    main()
