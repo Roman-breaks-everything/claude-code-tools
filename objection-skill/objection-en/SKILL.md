@@ -88,7 +88,9 @@ Punishment doesn't reinforce a stateless model's behavior: between turns there's
   1) generate ALL hypotheses BEFORE ranking (don't grab the first), ≥2–3 competing;
   2) score each: simplicity · scope · coherence · plausibility · **testability**; test the **cheapest first**;
   3) **terminator:** take the cause that passes the counterfactual test ("without it, would the problem NOT have happened?") + name a counter-metric (which observable shifts if the cause is right, and how to re-measure) → verify by action;
-  4) name the *map* the surprise is measured against (doc/test/name/assumption) — the paths it doesn't cover = the next hypothesis.
+  4) name the *map* the surprise is measured against (doc/test/name/assumption) — the paths it doesn't cover = the next hypothesis;
+  5) **trace to source:** for a defect in a chain, go BACKWARD from the symptom (value/call) to where the bad state originated, and fix at the source, not where it surfaced;
+  6) **repeated failure = wrong frame:** ~3 failed fixes in a row → suspect the frame/architecture itself, not the next patch → go to [Reframe], don't keep patching the symptom.
   *When NOT: an obvious single-cause break — just check it, no fan of hypotheses.*
 
 - **[Reframe]** — stuck / unusual / single angle:
